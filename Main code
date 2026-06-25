@@ -1,0 +1,120 @@
+// =============================================================================
+// HOW TO RUN THIS MVP
+// -----------------------------------------------------------------------------
+// 1. Install dependencies:
+//        pnpm install
+//
+// 2. Start the agent:
+//        pnpm mvp
+//    On startup you'll be prompted for any missing keys (entered in-memory only,
+//    nothing is written to disk):
+//        - LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET  (free at https://cloud.livekit.io)
+//        - OPENAI_API_KEY                                     (needs realtime access)
+//    If these are already in your environment / .env.local, you won't be asked.
+//
+// 3. Talk to it (the Node SDK has no terminal voice mode, so use a browser):
+//        - Open https://agents-playground.livekit.io
+//        - Select the SAME LiveKit project whose credentials you entered above
+//        - Connect — the agent joins and speaks the opening pitch (in Hindi).
+//          Reply by voice to go through: availability -> rate -> confirmation.
+//
+// What it does: a single realtime agent pitches a transport job, asks if the
+// trucker is available (captured via the recordResponse tool: yes -> thank +
+// ask rate, no -> wish them all the best), and logs the answer when the call ends.
+// =============================================================================
+
+import { ServerOptions, cli, defineAgent, llm, voice } from '@livekit/agents';
+import * as openai from '@livekit/agents-plugin-openai';
+import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
+import { z } from 'zod';
+
+// ---- Barebones LiveKit voice MVP ---------------------------------------------
+// A single realtime agent that pitches a transport job, asks if the trucker is
+// available, asks their rate, then reads it back to confirm. No tasks, tools,
+// cascade STT/TTS, or speech optimizations — just generateReply + a realtime model.
+
+// Sample job details (hardcoded for the demo; no per-call metadata plumbing).
+const NAME = 'sir';
+const QUINTAL = '50';
+const LOCATION1 = 'Indore';
+const LOCATION2 = 'Bhopal';
+
+// The four keys needed for a real voice demo (LiveKit Cloud + OpenAI realtime).
+const REQUIRED_KEYS = ['LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'OPENAI_API_KEY'];
+
+// Prompt (in-memory only, never written to disk) for any required key not already set.
+async function promptForMissingKeys(): Promise<void> {
+  const missing = REQUIRED_KEYS.filter((k) => !process.env[k]);
+  if (missing.length === 0) return;
+  const rl = createInterface({ input, output });
+  for (const key of missing) {
+    process.env[key] = (await rl.question(`Enter ${key}: `)).trim();
+  }
+  rl.close();
+}
+
+// Single-agent instructions: greet, pitch the job, ask availability, ask rate, confirm.
+function buildInstructions(): string {
+  return `You are calling from Lets Transport. The person you are calling is ${NAME}. You have a job: ${QUINTAL} quintals to be transported from ${LOCATION1} to ${LOCATION2}, with delivery after 2 days. Speak only in Hindi. Be professional, stay on topic, and do not use offensive words.
+Conversation flow:
+1. Greet ${NAME} by name and briefly introduce yourself as calling from Lets Transport.
+2. Describe the job (${QUINTAL} quintals, ${LOCATION1} to ${LOCATION2}, delivery after 2 days) and ask if they are available to take it.
+3. When they clearly answer yes or no, call the recordResponse tool with available=true (yes) or available=false (no). Then follow the tool's guidance for what to say next.
+4. If they were available, ask how much they will charge for the delivery, then read the rate back to confirm it and close.
+Keep responses short and natural. Ask one thing at a time.`;
+}
+
+// A basic yes/no tool: records whether the user agreed, tells the agent what to say next,
+// and reports the captured answer back to the caller via onResponse (for end-of-call logging).
+function buildTools(onResponse: (available: boolean) => void): llm.ToolContext {
+  return {
+    recordResponse: llm.tool({
+      description:
+        'Record whether the user is available/agrees (yes) or not (no). Call this once they clearly say yes or no.',
+      parameters: z.object({ available: z.boolean().describe('true if the user agreed, false if they declined') }),
+      execute: async ({ available }) => {
+        onResponse(available);
+        return available
+          ? 'The user agreed. Thank them warmly in Hindi, then ask what rate they will charge for the delivery.'
+          : 'The user declined. Wish them all the best in Hindi and close the conversation.';
+      },
+    }),
+  };
+}
+
+export default defineAgent({
+  entry: async (ctx) => {
+    const session = new voice.AgentSession({
+      // Realtime speech-to-speech model: the simplest possible pipeline (no STT/TTS/VAD).
+      llm: new openai.realtime.RealtimeModel({ model: 'gpt-realtime-2', voice: 'marin' }),
+    });
+    // Captured yes/no answer (null if the user never gave a clear answer).
+    let userAvailable: boolean | null = null;
+    const agent = new voice.Agent({
+      instructions: buildInstructions(),
+      tools: buildTools((available) => { userAvailable = available; }),
+    });
+    await session.start({ agent, room: ctx.room });
+    await ctx.connect();
+    // When the conversation ends, log the user's recorded response.
+    ctx.addShutdownCallback(async () => {
+      const answer = userAvailable === null ? 'no clear answer' : userAvailable ? 'yes (available)' : 'no (not available)';
+      console.log(`[mvp] user response: ${answer}`);
+    });
+    // Deliver the opening pitch; the rest of the ask-and-confirm flow is driven by the instructions.
+    session.generateReply({
+      instructions: `Greet ${NAME} by name, introduce yourself as Malika calling from Lets Transport, describe the job (${QUINTAL} quintals from ${LOCATION1} to ${LOCATION2}, delivery after 2 days), and ask if they are available. Speak only in Hindi.`,
+    });
+  },
+});
+
+// Prompt for any missing keys before starting the worker, then run in the chosen mode (e.g. dev).
+await promptForMissingKeys();
+cli.runApp(
+  new ServerOptions({
+    agent: fileURLToPath(import.meta.url),
+    agentName: 'mvp-agent',
+  }),
+);
